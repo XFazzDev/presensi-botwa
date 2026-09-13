@@ -1,0 +1,24 @@
+{
+  "name": "xfazz-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot Cek Tarif J&T Express",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "any-ascii": "^0.3.2",
+    "axios": "^1.20.0",
+    "baileys": "^7.0.0-rc.9",
+    "chalk": "^4.1.2",
+    "chokidar": "^4.0.3",
+    "dotenv": "^17.4.2",
+    "moment-timezone": "^0.5.45",
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

@@ -17,6 +17,7 @@
     "chalk": "^4.1.2",
     "chokidar": "^4.0.3",
     "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
     "moment-timezone": "^0.5.45",
     "pino": "^10.3.1",
     "qrcode-terminal": "^0.12.0"

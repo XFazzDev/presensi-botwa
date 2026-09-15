@@ -1,14 +1,8 @@
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 import {
-    makeWASocket,
-    fetchLatestBaileysVersion,
-    DisconnectReason,
-    useMultiFileAuthState,
-    makeCacheableSignalKeyStore,
-    isJidBroadcast,
-    jidDecode,
-    Browsers
+    makeWASocket, fetchLatestBaileysVersion, DisconnectReason,
+    useMultiFileAuthState, makeCacheableSignalKeyStore, jidDecode, Browsers
 } from "baileys";
 import qrcode from "qrcode-terminal";
 import Pino from "pino";
@@ -16,127 +10,351 @@ import chokidar from "chokidar";
 import fs from "fs";
 import { msgHandler as initialMsgHandler } from "./handler.js";
 import { Messages } from "./lib/Messages.js";
-import { saveToSheet, readSheet, formatSheetRows } from "./lib/Sheets.js";
+import {
+    saveToSheet, absenAll, addSiswa, hapusSiswa,
+    readSheet, exportExcel,
+    formatSheetRows, formatRekapSiswa,
+    parseTanggal
+} from "./lib/Sheets.js";
 
 let msgHandler = initialMsgHandler;
 const logger = Pino({ level: "silent" });
+const PREFIX = ".";
 
-// ─── Konstanta command ──────────────────────────────────────
-const SHEET_PREFIX = ".";
-const CMD_ABSEN    = "absen";     // .absen <no> | <status> | [tanggal]
-const CMD_READ     = "readsheet"; // .readsheet [tanggal]
+// ═══════════════════════════════════════════════════════════
+//  Utility
+// ═══════════════════════════════════════════════════════════
+async function react(sock, message, emoji) {
+    try {
+        await sock.sendMessage(message.key.remoteJid, {
+            react: { text: emoji, key: message.key }
+        });
+    } catch {}
+}
 
-const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL ||
-    "https://script.google.com/macros/s/AKfycbwzwY9edsa0gikxUAhPfTxct5abNxDmx0GXlL4HoK-VIsEZ3jOc0rSEeuQ-XTdUSCeK/exec";
-
-const SHEET_SECRET = process.env.SHEET_SECRET || "gd";
-
-/**
- * Format tanggal default (hari ini) dalam format YYYY-MM-DD.
- */
 function todayISO() {
     const d = new Date();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${d.getFullYear()}-${m}-${dd}`;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-/**
- * Handler command absensi & baca spreadsheet.
- */
-async function handleSheetCommands(sock, message) {
-    const text = message.text?.trim() || "";
-    if (!text.startsWith(SHEET_PREFIX)) return false;
+function splitArgs(text) {
+    return text.split("|").map(s => s.trim()).filter(Boolean);
+}
 
-    const lower  = text.toLowerCase();
-    const sender = message.key.remoteJid;
+// ═══════════════════════════════════════════════════════════
+//  Registry command
+//  Setiap handler: async (sock, message, arg, sender) => void
+// ═══════════════════════════════════════════════════════════
+const COMMANDS = {
 
-    // ── .absen <no> | <status> | [tanggal] ────────────────────
-    if (lower.startsWith(`${SHEET_PREFIX}${CMD_ABSEN}`)) {
-        const isi   = text.slice((SHEET_PREFIX + CMD_ABSEN).length).trim();
-        const parts = isi.split("|").map(s => s.trim());
-
-        if (parts.length < 2 || parts.some(p => !p)) {
+    // ── .absen <no> | <status> | <DD/MM/YYYY> ──────────────
+    async absen(sock, message, arg, sender) {
+        const parts = splitArgs(arg);
+        if (parts.length < 2) {
+            await react(sock, message, "❌");
             await sock.sendMessage(sender, {
-                text:
-                    `⚠️ Format salah.\n\n` +
-                    `*Format:*\n\`${SHEET_PREFIX}${CMD_ABSEN} <no> | <status> | <tanggal>\`\n\n` +
-                    `*Status:* \`h\` hadir, \`s\` sakit, \`i\` izin, \`a\` alpa\n` +
-                    `*Tanggal:* opsional, default hari ini. Format \`YYYY-MM-DD\` atau \`DD/MM/YYYY\`\n\n` +
-                    `*Contoh:*\n` +
-                    `\`${SHEET_PREFIX}${CMD_ABSEN} 4 | hadir | 2026-09-12\`\n` +
-                    `\`${SHEET_PREFIX}${CMD_ABSEN} 4 | s\``
-            });
-            return true;
+                text: `Format: .absen <no> | <status> | <DD/MM/YYYY>\nContoh: .absen 4 | H | 13/09/2026`
+            }, { quoted: message });
+            return;
+        }
+        const [no, status] = parts;
+        const tanggal = parts[2] ? parseTanggal(parts[2]) : todayISO();
+        if (!tanggal) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: "Tanggal harus DD/MM/YYYY" }, { quoted: message });
+            return;
         }
 
-        const no      = parts[0];
-        const status  = parts[1];
-        const tanggal = parts[2] || todayISO();
-
-        if (isNaN(parseInt(no, 10))) {
-            await sock.sendMessage(sender, { text: `⚠️ Nomor absen "${no}" tidak valid.` });
-            return true;
-        }
-
+        await react(sock, message, "⏳");
         try {
-            await sock.sendMessage(sender, { text: "⏳ Menyimpan absensi..." });
-
-            const res = await saveToSheet({
-                nomor: sender,
-                perintah: CMD_ABSEN,
-                no,
-                status,
-                tanggal,
-                extra: {
-                    pushName: message.pushName || "-",
-                    isGroup: sender?.endsWith("@g.us") || false
-                }
-            });
-
-            if (res?.status === "success") {
-                const emoji = { H: "✅", S: "🤒", I: "📝", A: "❌" }[res.statusCode] || "📝";
-                await sock.sendMessage(sender, {
-                    text:
-                        `${emoji} *Absensi tercatat!*\n\n` +
-                        `🔢 No: ${res.no}\n` +
-                        `👤 Nama: ${res.nama}\n` +
-                        `🏫 Kelas: ${res.kelas}\n` +
-                        `📅 Tanggal: ${res.tanggal}\n` +
-                        `📌 Status: ${res.statusLabel} (${res.statusCode})`
-                });
-            } else {
-                await sock.sendMessage(sender, {
-                    text: `❌ Gagal: ${res?.message || "unknown"}`
-                });
+            const res = await saveToSheet({ nomor: sender, no, status, tanggal });
+            if (res?.status === "success") await react(sock, message, "✅");
+            else {
+                await react(sock, message, "❌");
+                await sock.sendMessage(sender, { text: res?.message || "Gagal" }, { quoted: message });
             }
-        } catch (err) {
-            console.error("❌ saveToSheet error: - index.js:114", err.message);
-            await sock.sendMessage(sender, { text: `❌ Error: ${err.message}` });
+        } catch (e) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: e.message }, { quoted: message });
         }
-        return true;
-    }
+    },
 
-    // ── .readsheet [tanggal] ─────────────────────────────────
-    if (lower.startsWith(`${SHEET_PREFIX}${CMD_READ}`)) {
-        const arg = text.slice((SHEET_PREFIX + CMD_READ).length).trim();
+    // ── .absenall <range> | <status> | <DD/MM/YYYY> ────────
+    async absenall(sock, message, arg, sender) {
+        const parts = splitArgs(arg);
+        if (parts.length < 2) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, {
+                text: `Format: .absenall <range> | <status> | <DD/MM/YYYY>\n` +
+                      `Range: 1-33, 1,3,5, 1-10,15,20-25\n` +
+                      `Contoh: .absenall 1-33 | H | 13/09/2026`
+            }, { quoted: message });
+            return;
+        }
+        const { parseRange } = await import("./lib/Sheets.js");
+        const nos = parseRange(parts[0]);
+        if (nos.length === 0) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: `Range kosong: ${parts[0]}` }, { quoted: message });
+            return;
+        }
+        const status = parts[1];
+        const tanggal = parts[2] ? parseTanggal(parts[2]) : todayISO();
+        if (!tanggal) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: "Tanggal harus DD/MM/YYYY" }, { quoted: message });
+            return;
+        }
+
+        await react(sock, message, "⏳");
         try {
-            await sock.sendMessage(sender, { text: "⏳ Mengambil data..." });
-
-            const data = await readSheet();
-            const teks = formatSheetRows(data, { limit: 20, tanggal: arg || null });
-
-            await sock.sendMessage(sender, { text: teks });
-        } catch (err) {
-            console.error("❌ readSheet error: - index.js:131", err.message);
-            await sock.sendMessage(sender, { text: `❌ Error: ${err.message}` });
+            const res = await absenAll({ nos, status, tanggal });
+            if (res?.status === "success") {
+                await react(sock, message, "✅");
+                let msg = `Absen massal: ${res.updated} siswa terisi ${res.statusCode}.`;
+                if (res.skipped > 0) msg += `\n${res.skipped} dilewati: ${res.skippedNos.join(", ")}`;
+                await sock.sendMessage(sender, { text: msg }, { quoted: message });
+            } else {
+                await react(sock, message, "❌");
+                await sock.sendMessage(sender, { text: res?.message || "Gagal" }, { quoted: message });
+            }
+        } catch (e) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: e.message }, { quoted: message });
         }
-        return true;
-    }
+    },
 
-    return false;
+    // ── .add <nama> | <kelas> ──────────────────────────────
+    async add(sock, message, arg, sender) {
+        const parts = splitArgs(arg);
+        if (parts.length < 2) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, {
+                text: `Format: .add <nama> | <kelas>\nContoh: .add Budi Santoso | X-A`
+            }, { quoted: message });
+            return;
+        }
+        await react(sock, message, "⏳");
+        try {
+            const res = await addSiswa({ nama: parts[0], kelas: parts[1] });
+            if (res?.status === "success") {
+                await react(sock, message, "✅");
+                await sock.sendMessage(sender, {
+                    text: `Siswa ditambahkan.\nNo: ${res.no}\nNama: ${res.nama}\nKelas: ${res.kelas}`
+                }, { quoted: message });
+            } else {
+                await react(sock, message, "❌");
+                await sock.sendMessage(sender, { text: res?.message || "Gagal" }, { quoted: message });
+            }
+        } catch (e) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: e.message }, { quoted: message });
+        }
+    },
+
+    // ── .hapus <no> ────────────────────────────────────────
+    async hapus(sock, message, arg, sender) {
+        const no = arg.trim();
+        if (!/^\d+$/.test(no)) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: `Format: .hapus <no>` }, { quoted: message });
+            return;
+        }
+        await react(sock, message, "⏳");
+        try {
+            const res = await hapusSiswa({ no: parseInt(no, 10) });
+            if (res?.status === "success") {
+                await react(sock, message, "✅");
+                await sock.sendMessage(sender, {
+                    text: `Siswa no ${res.no} (${res.nama}) dinonaktifkan.\nNomor tidak dipakai ulang.`
+                }, { quoted: message });
+            } else {
+                await react(sock, message, "❌");
+                await sock.sendMessage(sender, { text: res?.message || "Gagal" }, { quoted: message });
+            }
+        } catch (e) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: e.message }, { quoted: message });
+        }
+    },
+
+    // ── .rekap <no> [file] ─────────────────────────────────
+    async rekap(sock, message, arg, sender) {
+        const parts = arg.trim().split(/\s+/);
+        const no = parseInt(parts[0], 10);
+        const asFile = parts.includes("file");
+
+        if (isNaN(no)) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, {
+                text: `Format: .rekap <no> [file]\nContoh:\n.rekap 4\n.rekap 4 file`
+            }, { quoted: message });
+            return;
+        }
+
+        await react(sock, message, "⏳");
+        try {
+            const data = await readSheet();
+            if (data?.status !== "success") throw new Error(data?.message || "Gagal baca data");
+
+            if (asFile) {
+                const buf = await exportExcel({ no });
+                const siswa = data.students.find(s => s.no === no);
+                const fname = `Rekap_${siswa?.nama?.replace(/\s+/g, "_") || no}.xlsx`;
+                await sock.sendMessage(sender, {
+                    document: buf,
+                    mimetype: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    fileName: fname
+                }, { quoted: message });
+                await react(sock, message, "✅");
+            } else {
+                const teks = formatRekapSiswa(data, no);
+                const isErr = teks.startsWith("❌");
+                await react(sock, message, isErr ? "❌" : "✅");
+                await sock.sendMessage(sender, { text: teks }, { quoted: message });
+            }
+        } catch (e) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: e.message }, { quoted: message });
+        }
+    },
+
+    // ── .readsheet <DD/MM/YYYY> ────────────────────────────
+    async readsheet(sock, message, arg, sender) {
+        const tgl = arg.trim();
+        if (!tgl) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, {
+                text: `Format: .readsheet DD/MM/YYYY\nContoh: .readsheet 13/09/2026`
+            }, { quoted: message });
+            return;
+        }
+        if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(tgl)) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: `Format tanggal salah. Gunakan DD/MM/YYYY.` }, { quoted: message });
+            return;
+        }
+
+        await react(sock, message, "⏳");
+        try {
+            const data = await readSheet();
+            const teks = formatSheetRows(data, { limit: 30, tanggal: tgl });
+            const isErr = teks.startsWith("⚠️") || teks.startsWith("❌");
+            await react(sock, message, isErr ? "❌" : "✅");
+            await sock.sendMessage(sender, { text: teks }, { quoted: message });
+        } catch (e) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: e.message }, { quoted: message });
+        }
+    },
+
+    // ── .export ────────────────────────────────────────────
+    async export(sock, message, arg, sender) {
+        await react(sock, message, "⏳");
+        try {
+            const buf = await exportExcel({});
+            const tgl = new Date().toISOString().slice(0, 10);
+            await sock.sendMessage(sender, {
+                document: buf,
+                mimetype: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                fileName: `Absensi_KIR_${tgl}.xlsx`
+            }, { quoted: message });
+            await react(sock, message, "✅");
+        } catch (e) {
+            await react(sock, message, "❌");
+            await sock.sendMessage(sender, { text: e.message }, { quoted: message });
+        }
+    },
+
+    // ── .menu ──────────────────────────────────────────────
+    async menu(sock, message, arg, sender) {
+        const menu =
+`╭━━━〔 📋 *MENU BOT KIR* 〕━━━╮
+
+*📌 ABSENSI*
+┃ .absen <no> | <status> | <tgl>
+┃   Absen satu siswa
+┃   Contoh: .absen 4 | H | 13/09/2026
+┃
+┃ .absenall <range> | <status> | <tgl>
+┃   Absen massal sekaligus
+┃   Contoh: .absenall 1-33 | H | 13/09/2026
+┃   Range: 1-33, 1,3,5, atau 1-10,15,20-25
+
+*👥 MANAJEMEN SISWA*
+┃ .add <nama> | <kelas>
+┃   Tambah siswa baru
+┃   Contoh: .add Budi Santoso | X-A
+┃
+┃ .hapus <no>
+┃   Nonaktifkan siswa (riwayat tetap aman)
+┃   Contoh: .hapus 34
+
+*📊 LAPORAN*
+┃ .rekap <no>
+┃   Riwayat absensi satu siswa
+┃   Contoh: .rekap 4
+┃
+┃ .rekap <no> file
+┃   Download riwayat siswa (Excel)
+┃   Contoh: .rekap 4 file
+┃
+┃ .readsheet <tgl>
+┃   Rekap absensi harian
+┃   Contoh: .readsheet 13/09/2026
+┃
+┃ .export
+┃   Download semua data (Excel)
+
+*ℹ️ LAINNYA*
+┃ .menu — tampilkan menu ini
+
+*📝 STATUS ABSENSI*
+┃ H = Hadir
+┃ S = Sakit
+┃ I = Izin
+┃ A = Alpa
+
+╰━━━━━━━━━━━━━━━━━━━━━━━━╯`;
+        await sock.sendMessage(sender, { text: menu }, { quoted: message });
+    }
+};
+
+// Alias biar user bisa pakai beberapa nama
+const ALIAS = {
+    "menu": "menu", "help": "menu", "bantuan": "menu",
+    "absen": "absen",
+    "absenall": "absenall", "absenmassal": "absenall",
+    "add": "add", "tambah": "add",
+    "hapus": "hapus", "del": "hapus",
+    "rekap": "rekap",
+    "readsheet": "readsheet", "rekapabsen": "readsheet",
+    "export": "export", "download": "export"
+};
+
+// ═══════════════════════════════════════════════════════════
+//  Dispatcher
+// ═══════════════════════════════════════════════════════════
+async function handleCommands(sock, message) {
+    const text = message.text?.trim() || "";
+    if (!text.startsWith(PREFIX)) return false;
+
+    // Parse: .cmd <arg>
+    const withoutPrefix = text.slice(PREFIX.length).trim();
+    const spaceIdx = withoutPrefix.search(/\s/);
+    const rawCmd = (spaceIdx === -1 ? withoutPrefix : withoutPrefix.slice(0, spaceIdx)).toLowerCase();
+    const arg = spaceIdx === -1 ? "" : withoutPrefix.slice(spaceIdx + 1);
+
+    const handler = ALIAS[rawCmd];
+    if (!handler || !COMMANDS[handler]) return false;
+
+    await COMMANDS[handler](sock, message, arg, message.key.remoteJid);
+    return true;
 }
 
+// ═══════════════════════════════════════════════════════════
+//  Main bot
+// ═══════════════════════════════════════════════════════════
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState("./session");
     const { version } = await fetchLatestBaileysVersion();
@@ -151,128 +369,76 @@ async function connectToWhatsApp() {
         version,
         logger,
         markOnlineOnConnect: true,
-        generateHighQualityLinkPreview: true,
+        generateHighQualityLinkPreview: false,
         browser: Browsers.macOS("Chrome")
     });
 
     sock.ev.process(async (ev) => {
-        // ─── Connection Update ─────────────────────────────────
         if (ev["connection.update"]) {
-            const update = ev["connection.update"];
-            const { connection, lastDisconnect } = update;
+            const { connection, lastDisconnect, qr } = ev["connection.update"];
             const status = lastDisconnect?.error?.output?.statusCode;
 
-            if (update.qr) {
-                qrcode.generate(update.qr, { small: true }, (qr) => {
+            if (qr) {
+                qrcode.generate(qr, { small: true }, (q) => {
                     console.clear();
-                    console.log("📱 Scan QR Code ini dengan WhatsApp:\n - index.js:168");
-                    console.log(qr);
+                    console.log("Scan QR:\n - index.js:384" + q);
                 });
             }
 
             if (connection === "close") {
-                const reason =
-                    Object.entries(DisconnectReason).find(([, v]) => v === status)?.[0] ||
-                    "unknown";
-                console.log(`⚡ Koneksi terputus  ${reason} (${status}) - index.js:177`);
-
-                switch (reason) {
-                    case "multideviceMismatch":
-                    case "loggedOut":
-                        console.error(lastDisconnect.error);
-                        fs.rmSync("./session", { recursive: true, force: true });
-                        console.log("🔄 Session dihapus. Jalankan ulang bot untuk scan QR baru. - index.js:184");
-                        break;
-                    case "connectionReplaced":
-                        console.log("⚠️ Koneksi digantikan oleh sesi lain. Bot berhenti. - index.js:187");
-                        break;
-                    default:
-                        if (status === 403) {
-                            console.error(lastDisconnect.error);
-                            fs.rmSync("./session", { recursive: true, force: true });
-                        } else {
-                            console.error(lastDisconnect.error?.message);
-                            connectToWhatsApp();
-                        }
+                const reason = Object.entries(DisconnectReason)
+                    .find(([, v]) => v === status)?.[0] || "unknown";
+                console.log(`Terputus  ${reason} (${status}) - index.js:391`);
+                if (reason === "loggedOut" || reason === "multideviceMismatch" || status === 403) {
+                    fs.rmSync("./session", { recursive: true, force: true });
+                    console.log("Session dihapus. Jalankan ulang untuk scan QR. - index.js:394");
+                } else if (reason !== "connectionReplaced") {
+                    connectToWhatsApp();
                 }
             } else if (connection === "open") {
-                console.log(`✅ Bot terhubung: ${jidDecode(sock?.user?.id)?.user} - index.js:199`);
-                console.log("🟢 Bot siap menerima pesan! - index.js:200");
+                console.log(`Bot terhubung: ${jidDecode(sock?.user?.id)?.user} - index.js:399`);
             }
         }
 
-        // ─── Save Credentials ─────────────────────────────────
-        if (ev["creds.update"]) {
-            await saveCreds();
-        }
+        if (ev["creds.update"]) await saveCreds();
 
-        // ─── Messages Upsert ──────────────────────────────────
         const upsert = ev["messages.upsert"];
         if (upsert) {
             if (upsert.type !== "notify") return;
             const message = Messages(upsert, sock);
+            if (!message) return;
             if (message.key?.remoteJid === "status@broadcast") return;
             if (
                 message.key?.fromMe &&
-                !(
-                    message.text?.toLowerCase().startsWith(".viewonce") ||
-                    message.text?.toLowerCase().startsWith(".del") ||
-                    message.text?.toLowerCase().startsWith(".math")
+                !["viewonce", "del", "math"].some(p =>
+                    message.text?.toLowerCase().startsWith("." + p)
                 )
             ) return;
-            if (!message) return;
 
-            const handled = await handleSheetCommands(sock, message);
+            const handled = await handleCommands(sock, message);
             if (handled) return;
 
             msgHandler(upsert, sock, message);
         }
 
-        // ─── Auto-reject Calls ────────────────────────────────
         if (ev["call"]) {
-            const call = ev["call"];
-            const { id, chatId, isGroup } = call[0];
+            const { id, chatId, isGroup } = ev["call"][0];
             if (isGroup) return;
             await sock.rejectCall(id, chatId);
-            await sock.sendMessage(
-                chatId,
-                { text: "Maaf, bot tidak bisa menerima panggilan suara/video. 🙏" },
-                { ephemeralExpiration: upsert?.messages?.[0]?.contextInfo?.expiration }
-            );
         }
     });
 }
 
 connectToWhatsApp();
 
-// ─── Keep-alive ping Apps Script tiap 5 menit ──────────────
-// Biar Apps Script tidak "tidur" dan cold start tidak bikin timeout.
-setInterval(async () => {
-    try {
-        const url = `${APPS_SCRIPT_URL}?secret=${encodeURIComponent(SHEET_SECRET)}`;
-        const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), 20000);
-        await fetch(url, { redirect: "follow", signal: controller.signal });
-        clearTimeout(t);
-        console.log("💓 Keepalive ping OK - index.js:257");
-    } catch (e) {
-        console.warn("⚠️  Keepalive gagal: - index.js:259", e.message);
-    }
-}, 5 * 60 * 1000);
-
 // ─── Hot-reload handler.js ─────────────────────────────────
 const watcher = chokidar.watch("./handler.js", {
-    ignored: /(^|[/\\])\../,
-    persistent: true
+    ignored: /(^|[/\\])\../, persistent: true
 });
-
-watcher.on("change", async (path) => {
-    console.log(`🔄 File ${path} berubah, hotreload handler... - index.js:270`);
+watcher.on("change", async () => {
     try {
-        const newModule = await import(`./handler.js?cacheBust=${Date.now()}`);
-        msgHandler = newModule.msgHandler;
-        console.log("✅ Handler berhasil diperbarui. - index.js:274");
-    } catch (err) {
-        console.error("❌ Gagal reload handler: - index.js:276", err);
-    }
+        const m = await import(`./handler.js?cacheBust=${Date.now()}`);
+        msgHandler = m.msgHandler;
+        console.log("Handler diperbarui. - index.js:442");
+    } catch (e) { console.error("Reload gagal: - index.js:443", e.message); }
 });
